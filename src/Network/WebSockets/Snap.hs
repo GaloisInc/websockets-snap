@@ -8,13 +8,14 @@ module Network.WebSockets.Snap
 
 
 --------------------------------------------------------------------------------
-import           Control.Concurrent            (forkIO, myThreadId, threadDelay)
+import           Control.Concurrent            (forkIO, myThreadId, threadDelay,
+                                                ThreadId, killThread)
 import           Control.Concurrent.MVar       (MVar, newEmptyMVar, putMVar,
-                                                takeMVar, newMVar)
+                                                takeMVar, tryTakeMVar)
 import           Control.Exception             (Exception (..),
                                                 SomeException (..), handle,
-                                                throw, throwTo)
-import           Control.Monad                 (forever)
+                                                throwIO, throwTo)
+import           Control.Monad                 (forever, unless)
 import           Control.Monad.Trans           (lift)
 import           Data.ByteString               (ByteString)
 import qualified Data.ByteString.Char8         as BC
@@ -52,10 +53,11 @@ instance Exception ServerAppDone where
 
 --------------------------------------------------------------------------------
 copyIterateeToMVar
-    :: ((Int -> Int) -> IO ())
+    :: MVar ThreadId
+    -> ((Int -> Int) -> IO ())
     -> MVar Chunk
     -> E.Iteratee ByteString IO ()
-copyIterateeToMVar tickle mvar = E.catchError go handler
+copyIterateeToMVar pingId tickle mvar = E.catchError go handler
   where
     go = do
         mbs <- EL.head
@@ -66,7 +68,10 @@ copyIterateeToMVar tickle mvar = E.catchError go handler
                 go
             Nothing -> lift (putMVar mvar Eof)
 
-    handler se@(SomeException e) = case cast e of
+    handler se@(SomeException e) = do
+      lift $ killPingThread pingId
+
+      case cast e of
         -- Clean exit
         Just ServerAppDone -> return ()
         -- Actual error
@@ -82,7 +87,7 @@ copyMVarToStream mvar = return go
         case chunk of
             Chunk x                 -> return (Just x)
             Eof                     -> return Nothing
-            Error (SomeException e) -> throw e
+            Error (SomeException e) -> throwIO e
 
 
 --------------------------------------------------------------------------------
@@ -90,19 +95,19 @@ copyStreamToIteratee
     :: E.Iteratee ByteString IO ()
     -> IO (Maybe BL.ByteString -> IO ())
 copyStreamToIteratee iteratee0 = do
-    ref <- newMVar =<< E.runIteratee iteratee0
+    ref <- newIORef =<< E.runIteratee iteratee0
     return (go ref)
   where
     go _   Nothing   = return ()
     go ref (Just bl) = do
-        step <- takeMVar ref
+        step <- readIORef ref
         case step of
             E.Continue f              -> do
                 let chunks = BL.toChunks bl
                 step' <- E.runIteratee $ f $ E.Chunks chunks
-                putMVar ref step'
-            E.Yield () _              -> putMVar ref step >> throw WS.ConnectionClosed
-            E.Error (SomeException e) -> putMVar ref step >> throw e
+                writeIORef ref step'
+            E.Yield () _              -> throwIO WS.ConnectionClosed
+            E.Error (SomeException e) -> throwIO e
 
 
 --------------------------------------------------------------------------------
@@ -133,6 +138,7 @@ runWebSocketsSnapWith options app = do
         parse      <- lift $ copyMVarToStream mvar
         write      <- lift $ copyStreamToIteratee writeEnd
         stream     <- lift $ WS.makeStream parse write
+        pingId     <- lift newEmptyMVar
 
         let options' = options
                     { WS.connectionOnPong = do
@@ -143,20 +149,23 @@ runWebSocketsSnapWith options app = do
             pc = WS.PendingConnection
                     { WS.pendingOptions  = options'
                     , WS.pendingRequest  = fromSnapRequest rq
-                    , WS.pendingOnAccept = forkPingThread tickle
+                    , WS.pendingOnAccept = forkPingThread pingId tickle
                     , WS.pendingStream   = stream
                     }
 
-        _ <- lift $ forkIO $ app pc >> throwTo thisThread ServerAppDone
-        copyIterateeToMVar tickle mvar
+        _ <- lift $ forkIO $ do app pc
+                                killPingThread pingId
+                                throwTo thisThread ServerAppDone
+        copyIterateeToMVar pingId tickle mvar
+
 
 
 --------------------------------------------------------------------------------
 -- | Start a ping thread in the background
-forkPingThread :: ((Int -> Int) -> IO ()) -> WS.Connection -> IO ()
-forkPingThread tickle conn = do
-    _ <- forkIO pingThread
-    return ()
+forkPingThread :: MVar ThreadId -> ((Int -> Int) -> IO ()) -> WS.Connection -> IO ()
+forkPingThread pingId tickle conn = do
+    tid <- forkIO pingThread
+    putMVar pingId tid
   where
     pingThread = handle ignore $ forever $ do
         WS.sendPing conn (BC.pack "ping")
@@ -165,6 +174,16 @@ forkPingThread tickle conn = do
 
     ignore :: SomeException -> IO ()
     ignore _   = return ()
+
+
+--------------------------------------------------------------------------------
+-- | Kill off the ping thread if it was forked.
+killPingThread :: MVar ThreadId -> IO ()
+killPingThread pingId = do
+    mb <- tryTakeMVar pingId
+    case mb of
+      Just tid -> killThread tid
+      Nothing  -> return ()
 
 
 --------------------------------------------------------------------------------
